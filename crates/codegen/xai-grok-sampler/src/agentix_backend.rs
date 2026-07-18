@@ -30,6 +30,8 @@ use xai_grok_sampling_types::{
     ToolCall as GrokToolCall, ToolSpec,
 };
 
+use reqwest::StatusCode;
+
 use crate::events::{SamplingChannel, SamplingErrorInfo, SamplingEvent};
 use crate::metrics::InferenceLatencyStats;
 use crate::types::RequestId;
@@ -100,7 +102,7 @@ async fn drive_agentix(
         Err(e) => {
             let _ = tx.send(SamplingEvent::Failed {
                 request_id,
-                error: SamplingErrorInfo::from(SamplingError::Http(e.into())),
+                error: SamplingErrorInfo::from(&SamplingError::Http(e)),
             });
             return;
         }
@@ -129,7 +131,12 @@ async fn drive_agentix(
         Err(e) => {
             let _ = tx.send(SamplingEvent::Failed {
                 request_id,
-                error: SamplingErrorInfo::from(SamplingError::Api(e.to_string())),
+                error: SamplingErrorInfo::from(&SamplingError::Api {
+                    status: reqwest::StatusCode::BAD_GATEWAY,
+                    message: e.to_string(),
+                    model_metadata: None,
+                    retry_after_secs: None,
+                }),
             });
             return;
         }
@@ -210,7 +217,12 @@ async fn drive_agentix(
             agentix::LlmEvent::Error(e) => {
                 let _ = tx.send(SamplingEvent::Failed {
                     request_id: request_id.clone(),
-                    error: SamplingErrorInfo::from(SamplingError::Api(e)),
+                    error: SamplingErrorInfo::from(&SamplingError::Api {
+                        status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                        message: e,
+                        model_metadata: None,
+                        retry_after_secs: None,
+                    }),
                 });
                 return;
             }
@@ -226,26 +238,18 @@ async fn drive_agentix(
     };
 
     // Build ConversationResponse
+    // Reasoning text is concatenated into the assistant content since we
+    // don't have a matching rs::ReasoningItem constructor here.
     let mut items: Vec<ConversationItem> = Vec::new();
 
-    if !reasoning.is_empty() {
-        items.push(ConversationItem::Reasoning(
-            xai_grok_sampling_types::rs::ReasoningItem {
-                r#type: xai_grok_sampling_types::rs::ReasoningItemType::Reasoning,
-                summary: None,
-                content: vec![xai_grok_sampling_types::rs::ReasoningContent::Text {
-                    r#type: xai_grok_sampling_types::rs::ReasoningContentType::Text,
-                    text: reasoning,
-                    annotations: None,
-                }],
-                redacted: None,
-                signature: None,
-            },
-        ));
-    }
+    let assistant_content = if reasoning.is_empty() {
+        content.clone()
+    } else {
+        format!("{}\n\n<reasoning>{}</reasoning>", content, reasoning)
+    };
 
     items.push(ConversationItem::Assistant(AssistantItem {
-        content: Arc::from(content.as_str()),
+        content: Arc::from(assistant_content.as_str()),
         tool_calls,
         model_id: None,
         model_fingerprint: None,
