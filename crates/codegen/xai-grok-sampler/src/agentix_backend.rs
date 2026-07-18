@@ -25,7 +25,7 @@ use crate::types::RequestId;
 pub(crate) use xai_grok_sampling_types::ApiBackend;
 
 /// Stream a ConcentrateAI request via agentix, producing [`SamplingEvent`]s.
-pub(crate) async fn stream_concentrate(
+pub async fn stream_concentrate(
     api_key: String,
     model: String,
     base_url: String,

@@ -17,7 +17,7 @@
 //! and the actor with its per-request task tie these layers together.
 
 pub mod actor;
-pub mod agentix_backend;
+pub pub mod agentix_backend;
 pub mod attribution;
 pub mod client;
 pub mod commands;

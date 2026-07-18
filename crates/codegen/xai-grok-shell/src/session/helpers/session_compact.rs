@@ -587,6 +587,11 @@ pub(crate) async fn generate_session_compact(
                 itl_max_ms: timing.itl_max_ms(),
             }
         }
+        ApiBackend::Concentrate => {
+            return Err(CompactFailure::Transient(
+                acp::Error::internal_error().data("compact not implemented for Concentrate backend".to_string())
+            ));
+        }
         ApiBackend::Messages => {
             let request = ConversationRequest {
                 items: chat_history,

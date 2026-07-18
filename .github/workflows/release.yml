@@ -21,10 +21,12 @@ jobs:
             target: x86_64-unknown-linux-gnu
             suffix: ""
             binary: xai-grok-pager
+            protoc: protobuf-compiler
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             suffix: ".exe"
             binary: xai-grok-pager.exe
+            protoc: protoc
 
     steps:
       - uses: actions/checkout@v4
@@ -35,20 +37,22 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler nasm
+      - name: Install protoc + NASM (Ubuntu)
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.protoc }} nasm
         if: matrix.os == 'ubuntu-latest'
 
       - name: Install protoc + NASM (Windows)
-        run: choco install protoc nasm
+        run: |
+          choco install protoc nasm -y
+          echo "PROTOC=C:\ProgramData\chocolatey\lib\protoc\tools\bin\protoc.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "C:\ProgramData\chocolatey\lib\protoc\tools\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
         if: matrix.os == 'windows-latest'
         shell: pwsh
 
       - name: Build release
         run: cargo build --release -p xai-grok-pager-bin --target ${{ matrix.target }}
         env:
-          CC: "gcc"
-          CXX: "g++"
+          PROTOC: ${{ env.PROTOC || 'protoc' }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

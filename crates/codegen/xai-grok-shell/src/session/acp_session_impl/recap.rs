@@ -551,6 +551,17 @@ impl SessionActor {
                 let events = xai_grok_sampler::stream_messages(raw, meta, request_id, idle_timeout);
                 xai_grok_sampler::collect_response(events).await
             }
+            crate::sampling::ApiBackend::Concentrate => {
+                let l2 = xai_grok_sampler::agentix_backend::stream_concentrate(
+                    sampling_client.config().api_key.clone().unwrap_or_default(),
+                    sampling_client.config().model.clone(),
+                    sampling_client.config().base_url.clone(),
+                    request,
+                    request_id,
+                    idle_timeout,
+                ).await.ok()?;
+                xai_grok_sampler::collect_response(l2).await
+            }
         };
 
         match result {
