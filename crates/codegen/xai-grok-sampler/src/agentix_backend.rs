@@ -4,19 +4,6 @@
 //! `Provider::SuperCloud` which speaks NDJSON to the Render proxy.
 //! This is a self-contained module: no changes needed to the existing
 //! stream transforms or Actor infrastructure.
-//!
-//! Usage from `request_task.rs`:
-//!
-//! ```ignore
-//! ApiBackend::Concentrate => {
-//!     match agentix_backend::stream_concentrate(
-//!         &client, request, request_id.clone(), idle_timeout,
-//!     ).await {
-//!         Ok(l2) => drive_l2(l2, request_id, event_tx, cancel_token, captured, None).await,
-//!         Err(e) => AttemptOutcome::InitFailed { error: e },
-//!     }
-//! }
-//! ```
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,8 +17,6 @@ use xai_grok_sampling_types::{
     ToolCall as GrokToolCall, ToolSpec,
 };
 
-use reqwest::StatusCode;
-
 use crate::events::{SamplingChannel, SamplingErrorInfo, SamplingEvent};
 use crate::metrics::InferenceLatencyStats;
 use crate::types::RequestId;
@@ -40,9 +25,6 @@ use crate::types::RequestId;
 pub(crate) use xai_grok_sampling_types::ApiBackend;
 
 /// Stream a ConcentrateAI request via agentix, producing [`SamplingEvent`]s.
-///
-/// Returns a boxed stream that emits exactly one terminal event:
-/// `SamplingEvent::Completed` on success or `SamplingEvent::Failed` on error.
 pub(crate) async fn stream_concentrate(
     api_key: String,
     model: String,
@@ -53,21 +35,16 @@ pub(crate) async fn stream_concentrate(
 ) -> Result<BoxStream<'static, SamplingEvent>, SamplingError> {
     let stream_start = Instant::now();
 
-    // Build agentix messages from ConversationRequest items
     let (messages, system_prompt) = build_agentix_messages(&request.items);
     let tools = build_agentix_tools(&request.tools);
 
-    // Create tokio::sync::mpsc channel to bridge agentix's LlmEvent stream
-    // with Grok Build's SamplingEvent stream
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SamplingEvent>();
 
-    // Emit StreamStarted immediately
     let _ = tx.send(SamplingEvent::StreamStarted {
         request_id: request_id.clone(),
         timestamp_ms: chrono::Utc::now().timestamp_millis(),
     });
 
-    // Spawn a task to drive the agentix request
     let req_id = request_id.clone();
     tokio::spawn(async move {
         drive_agentix(
@@ -76,7 +53,6 @@ pub(crate) async fn stream_concentrate(
         ).await;
     });
 
-    // Convert mpsc receiver into a Stream
     Ok(tokio_stream::wrappers::UnboundedReceiverStream::new(rx).boxed())
 }
 
@@ -108,7 +84,6 @@ async fn drive_agentix(
         }
     };
 
-    // Build agentix request
     let mut req = agentix::Request::supercloud(api_key)
         .model(model)
         .base_url(base_url);
@@ -116,16 +91,13 @@ async fn drive_agentix(
     if let Some(sys) = system_prompt {
         req = req.system_prompt(sys);
     }
-
     if !messages.is_empty() {
         req = req.messages(messages);
     }
-
     if !tools.is_empty() {
         req = req.tools(tools);
     }
 
-    // Stream
     let mut stream = match req.stream(&http).await {
         Ok(s) => s,
         Err(e) => {
@@ -136,13 +108,13 @@ async fn drive_agentix(
                     message: e.to_string(),
                     model_metadata: None,
                     retry_after_secs: None,
+                    should_retry: Some(true),
                 }),
             });
             return;
         }
     };
 
-    // Accumulators
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut tool_calls: Vec<GrokToolCall> = Vec::new();
@@ -222,24 +194,23 @@ async fn drive_agentix(
                         message: e,
                         model_metadata: None,
                         retry_after_secs: None,
+                        should_retry: Some(true),
                     }),
                 });
                 return;
             }
-            _ => {} // ReasoningSignature, AssistantState — ignore
+            _ => {}
         }
     }
 
     // Determine stop reason
     stop_reason = if tool_calls.is_empty() {
-        Some(StopReason::Stop)
+        Some(StopReason::EndTurn)
     } else {
         Some(StopReason::ToolUse)
     };
 
     // Build ConversationResponse
-    // Reasoning text is concatenated into the assistant content since we
-    // don't have a matching rs::ReasoningItem constructor here.
     let mut items: Vec<ConversationItem> = Vec::new();
 
     let assistant_content = if reasoning.is_empty() {
@@ -256,6 +227,8 @@ async fn drive_agentix(
         reasoning_effort: None,
     }));
 
+    let elapsed_ms = stream_start.elapsed().as_millis() as u64;
+
     let response = ConversationResponse {
         items,
         stop_reason,
@@ -267,10 +240,15 @@ async fn drive_agentix(
     };
 
     let metrics = InferenceLatencyStats {
-        ttfb_ms: 0,
-        ttlb_ms: stream_start.elapsed().as_millis() as u64,
-        duration_ms: stream_start.elapsed().as_millis() as u64,
-        ..Default::default()
+        time_to_first_token_ms: None,
+        time_to_last_byte_ms: elapsed_ms,
+        chunk_count: chunk_index as u32,
+        itl_intervals_ms: vec![],
+        itl_p50_ms: None,
+        itl_p99_ms: None,
+        itl_max_ms: None,
+        itl_mean_ms: None,
+        attempts: 1,
     };
 
     let _ = tx.send(SamplingEvent::Completed {
@@ -299,23 +277,12 @@ fn build_agentix_messages(items: &[ConversationItem]) -> (Vec<agentix::Message>,
                         ContentPart::Text { text } => {
                             content.push(agentix::Content::text(text.to_string()));
                         }
-                        ContentPart::Image { source, .. } => {
-                            // Try to convert image to base64 URL
-                            let url = match source.media_type.as_str() {
-                                "image/png" | "image/jpeg" | "image/gif" | "image/webp" => {
-                                    if let Some(data) = &source.data {
-                                        format!("data:{};base64,{}", source.media_type, data)
-                                    } else {
-                                        continue;
-                                    }
-                                }
-                                _ => continue,
-                            };
-                            // agentix doesn't have a direct ImageContent builder publicly,
-                            // so we fall back to text placeholder
+                        ContentPart::Image { url } => {
+                            // agentix doesn't have a direct ImageContent builder
+                            // publicly accessible, so use text placeholder.
+                            let _ = url; // suppress unused warning
                             content.push(agentix::Content::text("[image]"));
                         }
-                        _ => {}
                     }
                 }
                 if !content.is_empty() {
@@ -345,14 +312,9 @@ fn build_agentix_messages(items: &[ConversationItem]) -> (Vec<agentix::Message>,
                 });
             }
             ConversationItem::ToolResult(tool_result) => {
-                let content: Vec<agentix::Content> = tool_result
-                    .content
-                    .iter()
-                    .map(|c| agentix::Content::text(c.to_string()))
-                    .collect();
                 messages.push(agentix::Message::ToolResult {
-                    call_id: tool_result.tool_call_id.to_string(),
-                    content,
+                    call_id: tool_result.tool_call_id.clone(),
+                    content: vec![agentix::Content::text(tool_result.content.to_string())],
                 });
             }
             _ => {
