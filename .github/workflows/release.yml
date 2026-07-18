@@ -50,9 +50,17 @@ jobs:
         shell: pwsh
 
       - name: Build release
+        if: matrix.os != 'windows-latest'
         run: cargo build --release -p xai-grok-pager-bin --target ${{ matrix.target }}
         env:
           PROTOC: ${{ env.PROTOC || 'protoc' }}
+
+      - name: Build release (Windows)
+        if: matrix.os == 'windows-latest'
+        run: cargo build --release -p xai-grok-pager-bin --target ${{ matrix.target }}
+        env:
+          PROTOC: ${{ env.PROTOC || 'protoc' }}
+          RUSTFLAGS: -C link-args="/DEBUG:LongSymbolTruncate /INCREMENTAL:NO"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
