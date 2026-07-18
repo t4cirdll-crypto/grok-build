@@ -10,7 +10,7 @@
 //! ```ignore
 //! ApiBackend::Concentrate => {
 //!     match agentix_backend::stream_concentrate(
-//!         &client, request, request_id.clone(), idle_timeout,
+//!         api_key, model, base_url, request, request_id.clone(), idle_timeout,
 //!     ).await {
 //!         Ok(l2) => drive_l2(l2, request_id, event_tx, cancel_token, captured, None).await,
 //!         Err(e) => AttemptOutcome::InitFailed { error: e },
@@ -147,7 +147,6 @@ async fn drive_agentix(
     let mut reasoning = String::new();
     let mut tool_calls: Vec<GrokToolCall> = Vec::new();
     let mut usage: Option<TokenUsage> = None;
-    let mut stop_reason: Option<StopReason> = None;
     let mut chunk_index: u64 = 0;
     let mut first_token_seen = false;
 
@@ -231,15 +230,13 @@ async fn drive_agentix(
     }
 
     // Determine stop reason
-    stop_reason = if tool_calls.is_empty() {
+    let stop_reason = if tool_calls.is_empty() {
         Some(StopReason::Stop)
     } else {
         Some(StopReason::ToolUse)
     };
 
     // Build ConversationResponse
-    // Reasoning text is concatenated into the assistant content since we
-    // don't have a matching rs::ReasoningItem constructor here.
     let mut items: Vec<ConversationItem> = Vec::new();
 
     let assistant_content = if reasoning.is_empty() {
@@ -266,10 +263,11 @@ async fn drive_agentix(
         stop_message: None,
     };
 
+    let elapsed_ms = stream_start.elapsed().as_millis() as u64;
     let metrics = InferenceLatencyStats {
-        ttfb_ms: 0,
-        ttlb_ms: stream_start.elapsed().as_millis() as u64,
-        duration_ms: stream_start.elapsed().as_millis() as u64,
+        time_to_first_token_ms: None,
+        time_to_last_byte_ms: elapsed_ms,
+        chunk_count: chunk_index as u32,
         ..Default::default()
     };
 
@@ -299,23 +297,11 @@ fn build_agentix_messages(items: &[ConversationItem]) -> (Vec<agentix::Message>,
                         ContentPart::Text { text } => {
                             content.push(agentix::Content::text(text.to_string()));
                         }
-                        ContentPart::Image { source, .. } => {
-                            // Try to convert image to base64 URL
-                            let url = match source.media_type.as_str() {
-                                "image/png" | "image/jpeg" | "image/gif" | "image/webp" => {
-                                    if let Some(data) = &source.data {
-                                        format!("data:{};base64,{}", source.media_type, data)
-                                    } else {
-                                        continue;
-                                    }
-                                }
-                                _ => continue,
-                            };
+                        ContentPart::Image { url } => {
                             // agentix doesn't have a direct ImageContent builder publicly,
                             // so we fall back to text placeholder
                             content.push(agentix::Content::text("[image]"));
                         }
-                        _ => {}
                     }
                 }
                 if !content.is_empty() {
@@ -345,11 +331,8 @@ fn build_agentix_messages(items: &[ConversationItem]) -> (Vec<agentix::Message>,
                 });
             }
             ConversationItem::ToolResult(tool_result) => {
-                let content: Vec<agentix::Content> = tool_result
-                    .content
-                    .iter()
-                    .map(|c| agentix::Content::text(c.to_string()))
-                    .collect();
+                // tool_result.content is Arc<str> — a single text string
+                let content = vec![agentix::Content::text(tool_result.content.to_string())];
                 messages.push(agentix::Message::ToolResult {
                     call_id: tool_result.tool_call_id.to_string(),
                     content,
