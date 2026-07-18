@@ -521,26 +521,25 @@ impl SamplingClient {
         );
 
         let defaults = ClientDefaults {
-            model: config.model,
+            model: config.model.clone(),
             max_completion_tokens: config.max_completion_tokens,
             temperature: config.temperature,
             top_p: config.top_p,
-            api_backend: config.api_backend,
-            auth_scheme: config.auth_scheme,
+            api_backend: config.api_backend.clone(),
+            auth_scheme: config.auth_scheme.clone(),
             stream_tool_calls: config.stream_tool_calls,
             doom_loop_recovery: config.doom_loop_recovery,
         };
 
-        let config_for_field = config.clone();
         Ok(Self {
             http,
             default_headers: headers,
             base_url: config.base_url.clone(),
             defaults,
-            attribution_callback: config.attribution_callback,
-            bearer_resolver: config.bearer_resolver,
+            attribution_callback: config.attribution_callback.clone(),
+            bearer_resolver: config.bearer_resolver.clone(),
             header_injector: config.header_injector.clone(),
-            config: config_for_field,
+            config: config.clone(),
         })
     }
 
