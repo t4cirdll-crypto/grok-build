@@ -536,10 +536,10 @@ impl SamplingClient {
             default_headers: headers,
             base_url: config.base_url.clone(),
             defaults,
+            config,
             attribution_callback: config.attribution_callback,
             bearer_resolver: config.bearer_resolver,
-            header_injector: config.header_injector,
-            config,
+            header_injector: config.header_injector.clone(),
         })
     }
 
