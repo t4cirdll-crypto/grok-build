@@ -115,9 +115,21 @@ impl XaiProtoBuilder {
         // Can only process one input file when using --dependency_out=FILE.
         for proto in protos {
             let mut command = Command::new(protoc.unwrap_or(Path::new("protoc")));
+
+            // On Windows, /dev/stdout and /dev/null don't exist, which causes
+            // protoc to fail with "No such file or directory". Use a temp
+            // file for dependency output on Windows.
+            let (_dep_tempdir, dep_out, desc_out): (Option<tempfile::TempDir>, String, &str) = if cfg!(windows) {
+                let temp_dir = tempfile::TempDir::new().unwrap();
+                let dep_path = temp_dir.path().join("protoc.d");
+                (Some(temp_dir), format!("--dependency_out={}", dep_path.display()), "--descriptor_set_out=NUL")
+            } else {
+                (None, "--dependency_out=/dev/stdout".to_owned(), "--descriptor_set_out=/dev/null")
+            };
+
             command
-                .arg("--dependency_out=/dev/stdout")
-                .arg("--descriptor_set_out=/dev/null");
+                .arg(&dep_out)
+                .arg(desc_out);
 
             // Add protoc's well-known types include directory first (if found).
             // This is needed for Bazel sandboxed builds where protoc and its
@@ -143,14 +155,28 @@ impl XaiProtoBuilder {
                 return Err(anyhow::anyhow!("protoc command failed"));
             }
 
-            let output =
-                String::from_utf8(output.stdout).context("protoc command output not UTF-8")?;
+            // On Windows, dependency output was written to temp file; on Unix it's on stdout.
+            let output_text = if cfg!(windows) {
+                // Read from the temp dependency file
+                let dep_path = _dep_tempdir.as_ref().unwrap().path().join("protoc.d");
+                fs::read_to_string(&dep_path).unwrap_or_default()
+            } else {
+                String::from_utf8(output.stdout).context("protoc command output not UTF-8")?
+            };
 
-            let mut lines = output.lines();
+            if output_text.is_empty() {
+                continue;
+            }
+
+            let mut lines = output_text.lines();
             let first_line = lines.next().context("protoc command output is empty")?;
-            let prefix = "/dev/null:";
+            let prefix = if cfg!(windows) {
+                "NUL:"
+            } else {
+                "/dev/null:"
+            };
             let rem = first_line.strip_prefix(prefix).with_context(|| {
-                format!("protoc command output must start with /dev/null: {output:?}")
+                format!("protoc command output must start with {prefix}: {output_text:?}")
             })?;
             for line in iter::once(rem).chain(lines) {
                 let line = line.trim();
