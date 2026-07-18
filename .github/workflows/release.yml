@@ -36,20 +36,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler nasm
         if: matrix.os == 'ubuntu-latest'
 
-      - name: Install protoc (Windows)
-        run: choco install protoc
+      - name: Install protoc + NASM (Windows)
+        run: choco install protoc nasm
         if: matrix.os == 'windows-latest'
+        shell: pwsh
 
       - name: Build release
         run: cargo build --release -p xai-grok-pager-bin --target ${{ matrix.target }}
         env:
-          # Avoid aws-lc-sys NASM issues on Windows by using CMake
-          AWS_LC_SYS_NO_ASM: "1"
-          # Skip OpenSSL build, use ring/rustls
-          RUSTSEC_IGNORE: "1"
+          CC: "gcc"
+          CXX: "g++"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
