@@ -62,7 +62,7 @@ dependencies = [
 [[package]]
 name = "agentix"
 version = "0.27.0"
-source = "git+https://github.com/t4cirdll-crypto/agentix#c2c7a96c11a24e95ed12c6ac5a749e9908de9a74"
+source = "git+https://github.com/t4cirdll-crypto/agentix#c2c7a96669c17ff482fe99c9cd533b751a1d99dc"
 dependencies = [
  "agentix-macros",
  "async-stream",
@@ -83,7 +83,7 @@ dependencies = [
 [[package]]
 name = "agentix-macros"
 version = "0.5.1"
-source = "git+https://github.com/t4cirdll-crypto/agentix#c2c7a96c11a24e95ed12c6ac5a749e9908de9a74"
+source = "git+https://github.com/t4cirdll-crypto/agentix#c2c7a96669c17ff482fe99c9cd533b751a1d99dc"
 dependencies = [
  "proc-macro2",
  "quote",
