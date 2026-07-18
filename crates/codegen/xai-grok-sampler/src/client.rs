@@ -281,6 +281,7 @@ pub struct SamplingClient {
     default_headers: HeaderMap,
     base_url: String,
     defaults: ClientDefaults,
+    config: SamplerConfig,
     /// Optional 401-attribution hook. The shell wires this to emit a
     /// structured event at every UNAUTHORIZED arm so 401s can be
     /// bucketed by stale-snapshot vs. live-token-rejected. `None` for
@@ -533,8 +534,9 @@ impl SamplingClient {
         Ok(Self {
             http,
             default_headers: headers,
-            base_url: config.base_url,
+            base_url: config.base_url.clone(),
             defaults,
+            config: config,
             attribution_callback: config.attribution_callback,
             bearer_resolver: config.bearer_resolver,
             header_injector: config.header_injector,
@@ -543,6 +545,7 @@ impl SamplingClient {
 
     /// The sampler configuration used to build this client.
     pub fn config(&self) -> &SamplerConfig {
+        &self.config
         &self.config
     }
 
@@ -1995,6 +1998,17 @@ impl SamplingClient {
                 let (raw, meta) = self.conversation_stream_messages(request).await?;
                 let events = crate::stream::stream_messages(raw, meta, request_id, idle_timeout);
                 crate::stream::collect_response(events).await
+            }
+            ApiBackend::Concentrate => {
+                let l2 = crate::agentix_backend::stream_concentrate(
+                    self.config.api_key.clone().unwrap_or_default(),
+                    self.config.model.clone(),
+                    self.base_url.clone(),
+                    request,
+                    request_id,
+                    idle_timeout,
+                ).await?;
+                crate::stream::collect_response(l2).await
             }
         };
         result
