@@ -541,6 +541,11 @@ impl SamplingClient {
         })
     }
 
+    /// The sampler configuration used to build this client.
+    pub fn config(&self) -> &SamplerConfig {
+        &self.config
+    }
+
     /// The configured API backend for this client.
     pub fn api_backend(&self) -> ApiBackend {
         self.defaults.api_backend.clone()

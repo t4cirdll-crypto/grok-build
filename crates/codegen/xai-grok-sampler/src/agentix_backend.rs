@@ -1,0 +1,377 @@
+//! Adapter between Grok Build sampler types and the `agentix` LLM client.
+//!
+//! Implements the ConcentrateAI backend by delegating to agentix's
+//! `Provider::SuperCloud` which speaks NDJSON to the Render proxy.
+//! This is a self-contained module: no changes needed to the existing
+//! stream transforms or Actor infrastructure.
+//!
+//! Usage from `request_task.rs`:
+//!
+//! ```ignore
+//! ApiBackend::Concentrate => {
+//!     match agentix_backend::stream_concentrate(
+//!         &client, request, request_id.clone(), idle_timeout,
+//!     ).await {
+//!         Ok(l2) => drive_l2(l2, request_id, event_tx, cancel_token, captured, None).await,
+//!         Err(e) => AttemptOutcome::InitFailed { error: e },
+//!     }
+//! }
+//! ```
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use futures_util::StreamExt;
+use futures_util::stream::BoxStream;
+
+use xai_grok_sampling_types::{
+    AssistantItem, ConversationItem, ConversationRequest, ConversationResponse,
+    ContentPart, SamplingError, StopReason, TokenUsage,
+    ToolCall as GrokToolCall, ToolSpec,
+};
+
+use crate::events::{SamplingChannel, SamplingErrorInfo, SamplingEvent};
+use crate::metrics::InferenceLatencyStats;
+use crate::types::RequestId;
+
+// Re-export for the request_task dispatch
+pub(crate) use xai_grok_sampling_types::ApiBackend;
+
+/// Stream a ConcentrateAI request via agentix, producing [`SamplingEvent`]s.
+///
+/// Returns a boxed stream that emits exactly one terminal event:
+/// `SamplingEvent::Completed` on success or `SamplingEvent::Failed` on error.
+pub(crate) async fn stream_concentrate(
+    api_key: String,
+    model: String,
+    base_url: String,
+    request: ConversationRequest,
+    request_id: RequestId,
+    idle_timeout: Duration,
+) -> Result<BoxStream<'static, SamplingEvent>, SamplingError> {
+    let stream_start = Instant::now();
+
+    // Build agentix messages from ConversationRequest items
+    let (messages, system_prompt) = build_agentix_messages(&request.items);
+    let tools = build_agentix_tools(&request.tools);
+
+    // Create tokio::sync::mpsc channel to bridge agentix's LlmEvent stream
+    // with Grok Build's SamplingEvent stream
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<SamplingEvent>();
+
+    // Emit StreamStarted immediately
+    let _ = tx.send(SamplingEvent::StreamStarted {
+        request_id: request_id.clone(),
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    });
+
+    // Spawn a task to drive the agentix request
+    let req_id = request_id.clone();
+    tokio::spawn(async move {
+        drive_agentix(
+            api_key, model, base_url, system_prompt, messages, tools,
+            tx, req_id, idle_timeout, stream_start,
+        ).await;
+    });
+
+    // Convert mpsc receiver into a Stream
+    Ok(tokio_stream::wrappers::UnboundedReceiverStream::new(rx).boxed())
+}
+
+// ── Internal driver ───────────────────────────────────────────────────────────
+
+async fn drive_agentix(
+    api_key: String,
+    model: String,
+    base_url: String,
+    system_prompt: Option<String>,
+    messages: Vec<agentix::Message>,
+    tools: Vec<agentix::raw::shared::ToolDefinition>,
+    tx: tokio::sync::mpsc::UnboundedSender<SamplingEvent>,
+    request_id: RequestId,
+    _idle_timeout: Duration,
+    stream_start: Instant,
+) {
+    let http = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(SamplingEvent::Failed {
+                request_id,
+                error: SamplingErrorInfo::from(SamplingError::Http(e.into())),
+            });
+            return;
+        }
+    };
+
+    // Build agentix request
+    let mut req = agentix::Request::supercloud(api_key)
+        .model(model)
+        .base_url(base_url);
+
+    if let Some(sys) = system_prompt {
+        req = req.system_prompt(sys);
+    }
+
+    if !messages.is_empty() {
+        req = req.messages(messages);
+    }
+
+    if !tools.is_empty() {
+        req = req.tools(tools);
+    }
+
+    // Stream
+    let mut stream = match req.stream(&http).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = tx.send(SamplingEvent::Failed {
+                request_id,
+                error: SamplingErrorInfo::from(SamplingError::Api(e.to_string())),
+            });
+            return;
+        }
+    };
+
+    // Accumulators
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls: Vec<GrokToolCall> = Vec::new();
+    let mut usage: Option<TokenUsage> = None;
+    let mut stop_reason: Option<StopReason> = None;
+    let mut chunk_index: u64 = 0;
+    let mut first_token_seen = false;
+
+    while let Some(event) = stream.next().await {
+        match event {
+            agentix::LlmEvent::Token(text) => {
+                if !first_token_seen {
+                    first_token_seen = true;
+                    let _ = tx.send(SamplingEvent::FirstToken {
+                        request_id: request_id.clone(),
+                    });
+                }
+                content.push_str(&text);
+                let _ = tx.send(SamplingEvent::ChannelToken {
+                    request_id: request_id.clone(),
+                    channel: SamplingChannel::Text,
+                    text,
+                    chunk_index,
+                });
+                chunk_index += 1;
+            }
+            agentix::LlmEvent::Reasoning(text) => {
+                reasoning.push_str(&text);
+                let _ = tx.send(SamplingEvent::ChannelToken {
+                    request_id: request_id.clone(),
+                    channel: SamplingChannel::Reasoning,
+                    text,
+                    chunk_index,
+                });
+                chunk_index += 1;
+            }
+            agentix::LlmEvent::ToolCall(tc) => {
+                let tool_call = GrokToolCall {
+                    id: Arc::from(tc.id.as_str()),
+                    name: tc.name,
+                    arguments: Arc::from(tc.arguments.as_str()),
+                };
+                tool_calls.push(tool_call.clone());
+                let _ = tx.send(SamplingEvent::ToolCallDelta {
+                    request_id: request_id.clone(),
+                    tool_index: (tool_calls.len() - 1) as u32,
+                    id: Some(tool_call.id.to_string()),
+                    name: Some(tool_call.name.clone()),
+                    arguments_delta: Some(tool_call.arguments.to_string()),
+                });
+            }
+            agentix::LlmEvent::ToolCallChunk(tcc) => {
+                let _ = tx.send(SamplingEvent::ToolCallDelta {
+                    request_id: request_id.clone(),
+                    tool_index: tcc.index,
+                    id: if tcc.id.is_empty() { None } else { Some(tcc.id) },
+                    name: if tcc.name.is_empty() { None } else { Some(tcc.name) },
+                    arguments_delta: if tcc.delta.is_empty() { None } else { Some(tcc.delta) },
+                });
+            }
+            agentix::LlmEvent::Usage(u) => {
+                usage = Some(TokenUsage {
+                    prompt_tokens: u.prompt_tokens as u32,
+                    completion_tokens: u.completion_tokens as u32,
+                    total_tokens: u.total_tokens as u32,
+                    ..Default::default()
+                });
+            }
+            agentix::LlmEvent::Done => {
+                break;
+            }
+            agentix::LlmEvent::Error(e) => {
+                let _ = tx.send(SamplingEvent::Failed {
+                    request_id: request_id.clone(),
+                    error: SamplingErrorInfo::from(SamplingError::Api(e)),
+                });
+                return;
+            }
+            _ => {} // ReasoningSignature, AssistantState — ignore
+        }
+    }
+
+    // Determine stop reason
+    stop_reason = if tool_calls.is_empty() {
+        Some(StopReason::Stop)
+    } else {
+        Some(StopReason::ToolUse)
+    };
+
+    // Build ConversationResponse
+    let mut items: Vec<ConversationItem> = Vec::new();
+
+    if !reasoning.is_empty() {
+        items.push(ConversationItem::Reasoning(
+            xai_grok_sampling_types::rs::ReasoningItem {
+                r#type: xai_grok_sampling_types::rs::ReasoningItemType::Reasoning,
+                summary: None,
+                content: vec![xai_grok_sampling_types::rs::ReasoningContent::Text {
+                    r#type: xai_grok_sampling_types::rs::ReasoningContentType::Text,
+                    text: reasoning,
+                    annotations: None,
+                }],
+                redacted: None,
+                signature: None,
+            },
+        ));
+    }
+
+    items.push(ConversationItem::Assistant(AssistantItem {
+        content: Arc::from(content.as_str()),
+        tool_calls,
+        model_id: None,
+        model_fingerprint: None,
+        reasoning_effort: None,
+    }));
+
+    let response = ConversationResponse {
+        items,
+        stop_reason,
+        usage,
+        cost_usd_ticks: None,
+        message_chunks_emitted: chunk_index,
+        doom_loop_signals: vec![],
+        stop_message: None,
+    };
+
+    let metrics = InferenceLatencyStats {
+        ttfb_ms: 0,
+        ttlb_ms: stream_start.elapsed().as_millis() as u64,
+        duration_ms: stream_start.elapsed().as_millis() as u64,
+        ..Default::default()
+    };
+
+    let _ = tx.send(SamplingEvent::Completed {
+        request_id,
+        response: Box::new(response),
+        metrics,
+    });
+}
+
+// ── Type conversions ──────────────────────────────────────────────────────────
+
+/// Convert Grok Build ConversationItems to agentix Messages.
+fn build_agentix_messages(items: &[ConversationItem]) -> (Vec<agentix::Message>, Option<String>) {
+    let mut messages = Vec::new();
+    let mut system_prompt: Option<String> = None;
+
+    for item in items {
+        match item {
+            ConversationItem::System(sys) => {
+                system_prompt = Some(sys.content.to_string());
+            }
+            ConversationItem::User(user) => {
+                let mut content = Vec::new();
+                for part in &user.content {
+                    match part {
+                        ContentPart::Text { text } => {
+                            content.push(agentix::Content::text(text.to_string()));
+                        }
+                        ContentPart::Image { source, .. } => {
+                            // Try to convert image to base64 URL
+                            let url = match source.media_type.as_str() {
+                                "image/png" | "image/jpeg" | "image/gif" | "image/webp" => {
+                                    if let Some(data) = &source.data {
+                                        format!("data:{};base64,{}", source.media_type, data)
+                                    } else {
+                                        continue;
+                                    }
+                                }
+                                _ => continue,
+                            };
+                            // agentix doesn't have a direct ImageContent builder publicly,
+                            // so we fall back to text placeholder
+                            content.push(agentix::Content::text("[image]"));
+                        }
+                        _ => {}
+                    }
+                }
+                if !content.is_empty() {
+                    messages.push(agentix::Message::User(content));
+                }
+            }
+            ConversationItem::Assistant(assistant) => {
+                let tool_calls = assistant
+                    .tool_calls
+                    .iter()
+                    .map(|tc| agentix::request::ToolCall {
+                        id: tc.id.to_string(),
+                        name: tc.name.clone(),
+                        arguments: tc.arguments.to_string(),
+                    })
+                    .collect();
+
+                messages.push(agentix::Message::Assistant {
+                    content: if assistant.content.is_empty() {
+                        None
+                    } else {
+                        Some(assistant.content.to_string())
+                    },
+                    reasoning: None,
+                    tool_calls,
+                    provider_data: None,
+                });
+            }
+            ConversationItem::ToolResult(tool_result) => {
+                let content: Vec<agentix::Content> = tool_result
+                    .content
+                    .iter()
+                    .map(|c| agentix::Content::text(c.to_string()))
+                    .collect();
+                messages.push(agentix::Message::ToolResult {
+                    call_id: tool_result.tool_call_id.to_string(),
+                    content,
+                });
+            }
+            _ => {
+                // BackendToolCall, Reasoning — skip for now
+            }
+        }
+    }
+
+    (messages, system_prompt)
+}
+
+/// Convert Grok Build ToolSpecs to agentix ToolDefinitions.
+fn build_agentix_tools(tools: &[ToolSpec]) -> Vec<agentix::raw::shared::ToolDefinition> {
+    tools
+        .iter()
+        .map(|t| agentix::raw::shared::ToolDefinition {
+            kind: agentix::raw::shared::ToolKind::Function,
+            function: agentix::raw::shared::FunctionDefinition {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                parameters: t.parameters.clone(),
+                strict: None,
+            },
+        })
+        .collect()
+}

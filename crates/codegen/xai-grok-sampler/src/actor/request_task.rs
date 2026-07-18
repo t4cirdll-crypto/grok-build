@@ -132,6 +132,7 @@ pub(crate) async fn run_request_task(
         let doom_check = doom_policy.filter(|_| doom_retry_count < doom_max_retries);
         let outcome = run_one_attempt(
             &client,
+            &config,
             request.clone(),
             request_id.clone(),
             idle_timeout,
@@ -418,6 +419,7 @@ async fn apply_retry_decision(
 /// the attempt completes and its response can be accepted.
 async fn run_one_attempt(
     client: &SamplingClient,
+    config: &SamplerConfig,
     request: ConversationRequest,
     request_id: RequestId,
     idle_timeout: Duration,
@@ -458,6 +460,21 @@ async fn run_one_attempt(
             let (teed, captured) = tee_errors(raw);
             let l2 = stream_messages(teed, metadata, request_id.clone(), idle_timeout);
             drive_l2(l2, request_id, event_tx, cancel_token, captured, None).await
+        }
+        ApiBackend::Concentrate => {
+            let l2 = match crate::agentix_backend::stream_concentrate(
+                config.api_key.clone().unwrap_or_default(),
+                config.model.clone(),
+                config.base_url.clone(),
+                request,
+                request_id.clone(),
+                idle_timeout,
+            ).await {
+                Ok(l2) => l2,
+                Err(e) => return AttemptOutcome::InitFailed { error: e },
+            };
+            let empty_cell: ErrorCell = Arc::new(Mutex::new(None));
+            drive_l2(l2, request_id, event_tx, cancel_token, empty_cell, None).await
         }
     }
 }

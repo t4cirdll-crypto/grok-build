@@ -1018,6 +1018,9 @@ pub enum ApiBackend {
     Responses,
     /// Use the Anthropic Messages API (/v1/messages)
     Messages,
+    /// Use the ConcentrateAI proxy (SuperCloud Render proxy with NDJSON format)
+    /// via the `agentix` LLM client's Provider::SuperCloud.
+    Concentrate,
 }
 
 impl ApiBackend {
