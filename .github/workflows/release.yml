@@ -60,7 +60,7 @@ jobs:
         run: cargo build --release -p xai-grok-pager-bin --target ${{ matrix.target }}
         env:
           PROTOC: ${{ env.PROTOC || 'protoc' }}
-          RUSTFLAGS: -C link-args="/DEBUG:LongSymbolTruncate /INCREMENTAL:NO"
+          RUSTFLAGS: -C link-args=/DEBUG:LongSymbolTruncate
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
