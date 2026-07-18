@@ -43,7 +43,7 @@ pub(crate) use xai_grok_sampling_types::ApiBackend;
 ///
 /// Returns a boxed stream that emits exactly one terminal event:
 /// `SamplingEvent::Completed` on success or `SamplingEvent::Failed` on error.
-pub(crate) async fn stream_concentrate(
+pub async fn stream_concentrate(
     api_key: String,
     model: String,
     base_url: String,
