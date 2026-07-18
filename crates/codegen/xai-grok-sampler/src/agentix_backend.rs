@@ -22,7 +22,7 @@ use crate::metrics::InferenceLatencyStats;
 use crate::types::RequestId;
 
 // Re-export for the request_task dispatch
-pub(crate) use xai_grok_sampling_types::ApiBackend;
+pub use xai_grok_sampling_types::ApiBackend;
 
 /// Stream a ConcentrateAI request via agentix, producing [`SamplingEvent`]s.
 pub async fn stream_concentrate(
