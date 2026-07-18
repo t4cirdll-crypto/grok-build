@@ -1,0 +1,59 @@
+name: Build GrokSuper
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: ""
+            binary: xai-grok-pager
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: ".exe"
+            binary: xai-grok-pager.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        if: matrix.os == 'ubuntu-latest'
+
+      - name: Install protoc (Windows)
+        run: choco install protoc
+        if: matrix.os == 'windows-latest'
+
+      - name: Build release
+        run: cargo build --release -p xai-grok-pager-bin --target ${{ matrix.target }}
+        env:
+          # Avoid aws-lc-sys NASM issues on Windows by using CMake
+          AWS_LC_SYS_NO_ASM: "1"
+          # Skip OpenSSL build, use ring/rustls
+          RUSTSEC_IGNORE: "1"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: groksuper-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          retention-days: 7
