@@ -205,9 +205,9 @@ async fn drive_agentix(
 
     // Determine stop reason
     stop_reason = if tool_calls.is_empty() {
-        Some(StopReason::EndTurn)
+        Some(StopReason::Stop)
     } else {
-        Some(StopReason::ToolUse)
+        Some(StopReason::ToolCalls)
     };
 
     // Build ConversationResponse
